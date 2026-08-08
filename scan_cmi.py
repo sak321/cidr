@@ -1,77 +1,102 @@
+import socket
+import ipaddress
 import urllib.request
 import re
-import ipaddress
 
 CIDR_FILE = "cidrs.txt"
 OUTPUT_FILE = "cmi_valid_targets.txt"
 
-def get_sample_ip(cidr_str):
-    """提取代表性 IP，尝试 ::1 或 ::100"""
+def get_sample_ips(cidr_str):
+    """从 CIDR 抽样 3 个常见 IP 地址，防止单点不通"""
+    ips = []
     try:
         net = ipaddress.IPv6Network(cidr_str.strip(), strict=False)
-        # 获取网段内常见有效 IP
-        return str(net[1])
+        # 尝试 ::1, ::10, ::100
+        ips.append(str(net[1]))
+        if net.num_addresses > 16:
+            ips.append(str(net[16]))
+        if net.num_addresses > 256:
+            ips.append(str(net[256]))
     except Exception as e:
-        print(f"⚠️ 格式错误 [{cidr_str}]: {e}")
-        return None
+        print(f"⚠️ CIDR 格式解析错误 [{cidr_str}]: {e}")
+    return ips
+
+def check_tcp_port(ip, port=443, timeout=3):
+    """通过 TCP 建连测试端口通断 (最通用)"""
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
 
 def check_cf_colo(ip):
-    """验证 IP 是否可达并获取机房"""
+    """尝试获取 Cloudflare Colo 机房 (若失败返回 UNKNOWN)"""
     try:
-        url = f"https://[{ip}]/cdn-cgi/trace"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        url = f"http://[{ip}]/cdn-cgi/trace"
+        req = urllib.request.Request(url, headers={'Host': 'cloudflare.com', 'User-Agent': 'Mozilla/5.0'}, timeout=3)
         with urllib.request.urlopen(req) as response:
             content = response.read().decode('utf-8')
             match = re.search(r'colo=([A-Z]+)', content)
             if match:
-                return True, match.group(1)
-    except Exception as e:
+                return match.group(1)
+    except Exception:
         pass
-    return False, "TIMEOUT/UNREACHABLE"
+    return "UNKNOWN"
 
 def main():
     valid_results = []
     
     try:
         with open(CIDR_FILE, "r") as f:
-            cidrs = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            lines = f.readlines()
+            cidrs = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
     except FileNotFoundError:
         print(f"❌ 找不到文件: {CIDR_FILE}")
         return
 
-    print(f"🔍 开始检测 {len(cidrs)} 个 CIDR...\n")
+    print(f"==========================================")
+    print(f"🔍 启动检测 | 共有 {len(cidrs)} 个 CIDR 待处理")
+    print(f"==========================================\n")
 
-    for cidr in cidrs:
-        ip = get_sample_ip(cidr)
-        if not ip:
-            continue
-            
-        print(f"正在测试: {cidr} (测试 IP: {ip})")
+    for idx, cidr in enumerate(cidrs, 1):
+        print(f"[{idx}/{len(cidrs)}] 正在检测 CIDR: {cidr}")
+        sample_ips = get_sample_ips(cidr)
         
-        # 1. 验证可达性与机房
-        is_ok, colo = check_cf_colo(ip)
-        if is_ok:
-            print(f"  ✅ [有效节点] 机房/Colo: {colo}")
+        if not sample_ips:
+            print(f"  └─ ❌ 提取 IP 失败，跳过。")
+            continue
+
+        is_valid = False
+        hit_ip = ""
+        
+        # 轮询探测抽样的 IP
+        for ip in sample_ips:
+            print(f"  ├─ 尝试 TCP 443 探测: {ip} ... ", end="")
+            if check_tcp_port(ip, port=443, timeout=3):
+                print("✅ 成功!")
+                is_valid = True
+                hit_ip = ip
+                break
+            else:
+                print("❌ 端口不通")
+
+        if is_valid:
+            colo = check_cf_colo(hit_ip)
+            print(f"  └─ 🎉 [网段有效] 响应 IP: {hit_ip} | Colo 机房: {colo}\n")
             valid_results.append(f"{cidr} # Colo:{colo}")
         else:
-            # 如果 ::1 不通，尝试 ::100 再测一次
-            try:
-                net = ipaddress.IPv6Network(cidr.strip(), strict=False)
-                backup_ip = str(net[256]) # ::100
-                is_ok_2, colo_2 = check_cf_colo(backup_ip)
-                if is_ok_2:
-                    print(f"  ✅ [备用 IP 有效] 机房/Colo: {colo_2}")
-                    valid_results.append(f"{cidr} # Colo:{colo_2}")
-                    continue
-            except Exception:
-                pass
-            print(f"  ❌ [无响应/不可达]")
+            print(f"  └─ ❌ [网段无效] 所有抽样 IP 均无响应\n")
 
     # 写入结果
     with open(OUTPUT_FILE, "w") as f:
         f.write("\n".join(valid_results))
-        
-    print(f"\n🎉 处理完毕，筛选出 {len(valid_results)} 个有效 CIDR，已写入 {OUTPUT_FILE}")
+
+    print(f"==========================================")
+    print(f"🎉 处理完成！保留有效段: {len(valid_results)} 个")
+    print(f"==========================================")
 
 if __name__ == "__main__":
     main()
