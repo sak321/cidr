@@ -1,53 +1,33 @@
-import json
-import subprocess
-import re
 import urllib.request
+import re
 import ipaddress
 
 CIDR_FILE = "cidrs.txt"
 OUTPUT_FILE = "cmi_valid_targets.txt"
 
 def get_sample_ip(cidr_str):
-    """提取代表性 IP，优先选择 ::1"""
+    """提取代表性 IP，尝试 ::1 或 ::100"""
     try:
         net = ipaddress.IPv6Network(cidr_str.strip(), strict=False)
+        # 获取网段内常见有效 IP
         return str(net[1])
     except Exception as e:
-        print(f"⚠️ invalid CIDR format [{cidr_str}]: {e}")
+        print(f"⚠️ 格式错误 [{cidr_str}]: {e}")
         return None
 
-def check_cmi_route(ip):
-    """检查路由中是否包含 CMI (AS58453)"""
-    try:
-        cmd = ["nexttrace", "--json", "--language", "en", ip]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if result.returncode != 0:
-            return False
-        
-        data = json.loads(result.stdout)
-        for hop in data.get("hops", []):
-            for route in hop.get("routes", []):
-                as_num = route.get("as_number", "")
-                if as_num == 58453 or "AS58453" in str(as_num):
-                    return True
-        return False
-    except Exception as e:
-        print(f"⚠️ Tracing error for {ip}: {e}")
-        return False
-
 def check_cf_colo(ip):
-    """检测 Cloudflare 机房名称（若无法检测则返回 UNKNOWN）"""
+    """验证 IP 是否可达并获取机房"""
     try:
         url = f"https://[{ip}]/cdn-cgi/trace"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        with urllib.request.urlopen(req) as response:
             content = response.read().decode('utf-8')
             match = re.search(r'colo=([A-Z]+)', content)
             if match:
-                return match.group(1)
-    except Exception:
+                return True, match.group(1)
+    except Exception as e:
         pass
-    return "UNKNOWN"
+    return False, "TIMEOUT/UNREACHABLE"
 
 def main():
     valid_results = []
@@ -56,32 +36,42 @@ def main():
         with open(CIDR_FILE, "r") as f:
             cidrs = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     except FileNotFoundError:
-        print(f"❌ Error: {CIDR_FILE} not found!")
+        print(f"❌ 找不到文件: {CIDR_FILE}")
         return
 
-    print(f"🔍 Found {len(cidrs)} CIDRs to scan.\n")
+    print(f"🔍 开始检测 {len(cidrs)} 个 CIDR...\n")
 
     for cidr in cidrs:
         ip = get_sample_ip(cidr)
         if not ip:
             continue
             
-        print(f"Processing: {cidr} (Test IP: {ip})")
+        print(f"正在测试: {cidr} (测试 IP: {ip})")
         
-        # 1. 检查路由
-        is_cmi = check_cmi_route(ip)
-        if is_cmi:
-            colo = check_cf_colo(ip)
-            print(f"  👉  MATCH! [CMI Route] | Colo: {colo}")
+        # 1. 验证可达性与机房
+        is_ok, colo = check_cf_colo(ip)
+        if is_ok:
+            print(f"  ✅ [有效节点] 机房/Colo: {colo}")
             valid_results.append(f"{cidr} # Colo:{colo}")
         else:
-            print(f"  ❌  FAIL: No CMI (AS58453) found in route.")
+            # 如果 ::1 不通，尝试 ::100 再测一次
+            try:
+                net = ipaddress.IPv6Network(cidr.strip(), strict=False)
+                backup_ip = str(net[256]) # ::100
+                is_ok_2, colo_2 = check_cf_colo(backup_ip)
+                if is_ok_2:
+                    print(f"  ✅ [备用 IP 有效] 机房/Colo: {colo_2}")
+                    valid_results.append(f"{cidr} # Colo:{colo_2}")
+                    continue
+            except Exception:
+                pass
+            print(f"  ❌ [无响应/不可达]")
 
     # 写入结果
     with open(OUTPUT_FILE, "w") as f:
         f.write("\n".join(valid_results))
         
-    print(f"\n✅ Finished. Found {len(valid_results)} valid CMI CIDRs.")
+    print(f"\n🎉 处理完毕，筛选出 {len(valid_results)} 个有效 CIDR，已写入 {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
