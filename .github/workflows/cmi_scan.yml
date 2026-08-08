@@ -1,0 +1,36 @@
+name: CMI IPv6 CIDR Auto Scanner
+
+on:
+  schedule:
+    # 北京时间每周一凌晨 04:00 (UTC 时间周日 20:00) 自动运行
+    - cron: '0 20 * * 0'
+  workflow_dispatch: # 支持在 GitHub Web 界面手动点击“Run workflow”随时触发
+
+jobs:
+  scan-and-filter:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install NextTrace
+        run: |
+          curl -sCost3.https://raw.githubusercontent.com/nxtrace/Nxtrace-cli/main/install.sh | bash
+
+      - name: Run CMI Filter Script
+        run: |
+          python scan_cmi.py
+
+      - name: Commit and Push CMI Filtered Results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add cmi_valid_targets.txt
+          # 仅在生成的文件有变化时才提交，防止产生无意义的空 Commit
+          git diff-index --quiet HEAD || (git commit -m "auto: update validated CMI IPv6 targets" && git push)
