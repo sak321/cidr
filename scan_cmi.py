@@ -4,21 +4,20 @@ import re
 import urllib.request
 import ipaddress
 
-# 输入的 IPv6 CIDR 列表文件
 CIDR_FILE = "cidrs.txt"
-# 输出筛选后的 CMI 候选 IP/CIDR 结果
 OUTPUT_FILE = "cmi_valid_targets.txt"
 
 def get_sample_ip(cidr_str):
-    """从 CIDR 中提取一个代表性 IP（获取网段内的第 2 个 IP）"""
+    """提取代表性 IP，优先选择 ::1"""
     try:
         net = ipaddress.IPv6Network(cidr_str.strip(), strict=False)
         return str(net[1])
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ invalid CIDR format [{cidr_str}]: {e}")
         return None
 
 def check_cmi_route(ip):
-    """通过 NextTrace 检查路由是否包含 AS58453 (CMI)"""
+    """检查路由中是否包含 CMI (AS58453)"""
     try:
         cmd = ["nexttrace", "--json", "--language", "en", ip]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -26,7 +25,6 @@ def check_cmi_route(ip):
             return False
         
         data = json.loads(result.stdout)
-        # 遍历所有路由跳数，检查是否有 AS58453
         for hop in data.get("hops", []):
             for route in hop.get("routes", []):
                 as_num = route.get("as_number", "")
@@ -34,11 +32,11 @@ def check_cmi_route(ip):
                     return True
         return False
     except Exception as e:
-        print(f"Error tracing {ip}: {e}")
+        print(f"⚠️ Tracing error for {ip}: {e}")
         return False
 
 def check_cf_colo(ip):
-    """对 Cloudflare 节点检查 Colo (机房) 是否为 HKG / TYO / NRT"""
+    """检测 Cloudflare 机房名称（若无法检测则返回 UNKNOWN）"""
     try:
         url = f"https://[{ip}]/cdn-cgi/trace"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -46,13 +44,10 @@ def check_cf_colo(ip):
             content = response.read().decode('utf-8')
             match = re.search(r'colo=([A-Z]+)', content)
             if match:
-                colo = match.group(1)
-                # 仅保留香港、东京、成田机房
-                if colo in ["HKG", "TYO", "NRT"]:
-                    return True, colo
+                return match.group(1)
     except Exception:
         pass
-    return False, None
+    return "UNKNOWN"
 
 def main():
     valid_results = []
@@ -61,34 +56,32 @@ def main():
         with open(CIDR_FILE, "r") as f:
             cidrs = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     except FileNotFoundError:
-        print(f"❌ Error: {CIDR_FILE} not found in root directory!")
+        print(f"❌ Error: {CIDR_FILE} not found!")
         return
+
+    print(f"🔍 Found {len(cidrs)} CIDRs to scan.\n")
 
     for cidr in cidrs:
         ip = get_sample_ip(cidr)
         if not ip:
             continue
             
-        print(f"Checking {cidr} (Sample IP: {ip})...")
+        print(f"Processing: {cidr} (Test IP: {ip})")
         
-        # 1. 验证是否走 CMI 路由
+        # 1. 检查路由
         is_cmi = check_cmi_route(ip)
-        if not is_cmi:
-            print(f"❌ {cidr} -> Not CMI")
-            continue
-            
-        # 2. 验证 CDN 机房 (针对 Cloudflare)
-        is_valid_colo, colo = check_cf_colo(ip)
-        if is_valid_colo:
-            print(f"✅ {cidr} -> CMI Match! Colo: {colo}")
-            valid_results.append(f"{cidr} # {colo}")
+        if is_cmi:
+            colo = check_cf_colo(ip)
+            print(f"  👉  MATCH! [CMI Route] | Colo: {colo}")
+            valid_results.append(f"{cidr} # Colo:{colo}")
         else:
-            print(f"⚠️ {cidr} -> CMI Route ok, but Colo check skipped/failed")
+            print(f"  ❌  FAIL: No CMI (AS58453) found in route.")
 
-    # 保存筛选结果
+    # 写入结果
     with open(OUTPUT_FILE, "w") as f:
         f.write("\n".join(valid_results))
-    print(f"\nDone! Saved valid CMI targets to {OUTPUT_FILE}")
+        
+    print(f"\n✅ Finished. Found {len(valid_results)} valid CMI CIDRs.")
 
 if __name__ == "__main__":
     main()
